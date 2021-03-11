@@ -1,9 +1,13 @@
-﻿using System;
+﻿using EgoUdpClient.Protocol;
+using System;
+using System.Collections.Concurrent;
 using System.Collections.Generic;
+using System.IO;
 using System.Linq;
 using System.Net;
 using System.Net.Sockets;
 using System.Text;
+using System.Threading;
 using System.Threading.Tasks;
 
 namespace EgoUdpClient
@@ -12,57 +16,55 @@ namespace EgoUdpClient
     {
         public string Host { get; set; } = "127.0.0.1";//"10.3.2.31";
         public int Port { get; set; }
-        public int Timeout { get; set; } = 5;
+        public int Timeout { get; set; } = 30;
+        public int BufferSize { get; set; } = 256;
 
-        private IPEndPoint RemoteAddress;
+        public bool Started { get; set; }
+        public bool Connected { get; set; }
+        private Packet packet { get; set; }
 
-        internal bool IsConnected = false;
+        struct QItem
+        {
+            public Request Request { get; set; }
+            public Response Response { get; set; }
+            public bool Sended { get; set; }
+            public bool Received { get; set; }
+        }
+        private ConcurrentDictionary<string, QItem> queue = new ConcurrentDictionary<string, QItem>();
+        private IPEndPoint RemotePoint;
+        private static readonly object locker = new object();
 
-        public delegate void ConnectedHandler();
+        //Флаг для остановки потока приема и отправки
+        //private CancellationTokenSource cancellToken;
+
+        public delegate void ConnectedHandler(Client client);
         public event ConnectedHandler OnConnected;
 
-        public delegate void DisconnectedHandler();
+        public delegate void DisconnectedHandler(Client client);
         public event DisconnectedHandler OnDisconnected;
 
-        public int Interval { get; set; } = 1000;
-
-        //Список сообщений для отправки
-        //List<Message> Messages = new List<Message>();
-        internal DevLocService.Server.Buffer Buffer = new DevLocService.Server.Buffer();
-        //Сообщение
-        SendMessage sendMessage = new SendMessage();
-        //Флаг для остановки потока приема и отправки
-        CancellationTokenSource cancellToken = new CancellationTokenSource();
-        //Сериализаторы сообщений
-        DataContractJsonSerializer SendJson = new DataContractJsonSerializer(typeof(SendMessage));
-        DataContractJsonSerializer ReceiveJson = new DataContractJsonSerializer(typeof(Response));
-
-        public Client(string Hostname, int LocalPort, int RemotePort)
+        public Client(string Host, int Port, int Timeout)
         {
-            this.Hostname = Hostname;
-            this.LocalPort = LocalPort;
-            this.RemotePort = RemotePort;
-        }
-
-        public Client(string Hostname, int LocalPort, int RemotePort, int Timeout)
-        {
-            this.Hostname = Hostname;
-            this.LocalPort = LocalPort;
-            this.RemotePort = RemotePort;
+            this.Host = Host;
+            this.Port = Port;
             this.Timeout = Timeout;
         }
 
-        public void Start()
+        public void Start(string hostname, string login, string domain, string version)
         {
-            //Переменная для удаленного адреса которую будем заполнять
+            packet = new Packet(hostname, login, domain, version);
+            packet.Header.Event = Events.Connected;
+
+            Started = true;
+
             IPAddress remoteIpAddress;
             try
             {
                 //Пытаемся получить адрес из строковой переменной
-                if (!IPAddress.TryParse(Hostname, out remoteIpAddress))
+                if (!IPAddress.TryParse(Host, out remoteIpAddress))
                 {
                     //Резолвим хост и получаем все ip адреса
-                    var ipaddresses = Dns.GetHostAddresses(Hostname);
+                    var ipaddresses = Dns.GetHostAddresses(Host);
                     //Что то пошло не так
                     if (ipaddresses.Length == 0)
                     {
@@ -72,107 +74,186 @@ namespace EgoUdpClient
                     remoteIpAddress = ipaddresses[0];
                 }
                 //Формируем адресс для удаленной точки подключения
-                RemoteAddress = new IPEndPoint(remoteIpAddress, RemotePort);
-                //this.Connect(Hostname, Port);
-                //Запускаем слушатель
-                ReceiveMessageAsync();
+                RemotePoint = new IPEndPoint(remoteIpAddress, Port);
+                //cancellToken = new CancellationTokenSource();
                 //Запускаем бесконечную отправку пакетов на сервер
-                ConnectAsync();
+                sendAsync();
+                //Запускаем слушатель
+                receiveAsync();
             }
-            catch (Exception ex)
+            catch
             {
-                Logger.Error("Server.Client.Start", ex);
-                Thread.Sleep(3000);
-                Start();
+                Started = false;
             }
         }
 
-        public async void StartAsync()
+        public void StartAsync(string hostname, string login, string domain, string version)
         {
-            await Task.Run(() => Start());
+            Task.Run(() => Start(hostname, login, domain, version));
         }
 
-        public void Stop()
+        private void send()
         {
-            Send(new Request(Commands.Disconnected, Methods.None));
-            cancellToken.Cancel();
-            Close();
-        }
-
-        //Зацикливаем отправку сообщения на сервер, учитывая интервал
-        private void Connect()
-        {
-            while (!cancellToken.Token.IsCancellationRequested)
+            QItem item;
+            while (Started)
             {
                 try
                 {
-                    if (IsWrite)
+                    foreach (var key in queue.Keys)
                     {
-                        continue;
-                    }
-
-                    //Проверяем и вставляем прицеп
-                    if (IsConnected)
-                    {
-                        sendMessage.Body = Buffer.GetRequestForSend();
-                    }
-                    else
-                    {
-                        sendMessage.Body = new Request(Commands.Connected, Methods.None);
-                    }
-
-                    using (MemoryStream stream = new MemoryStream())
-                    {
-                        //Сериализуем структуру в JSON
-                        SendJson.WriteObject(stream, sendMessage);
-                        //Возвращаем корретку в начало
-                        stream.Position = 0;
-                        using (StreamReader reader = new StreamReader(stream))
+                        if (queue.TryGetValue(key, out item))
                         {
-                            //Конвертируем в байты
-                            byte[] data = Encoding.UTF8.GetBytes(reader.ReadToEnd());
-                            //Отправляем данные в порт
-                            int n = Send(data, data.Length, RemoteAddress);
-                            //WaitResponseAsync(sendMessage.Body.Id);
-                            sendMessage.Body = null;
+                            if (!item.Sended)
+                            {
+                                lock (locker)
+                                {
+                                    packet.Request = item.Request;
+                                }
+                                if (queue.TryUpdate(key,
+                                    new QItem()
+                                    {
+                                        Request = item.Request,
+                                        Sended = true
+                                    }, item))
+                                {
+                                    break;
+                                }
+                            }
                         }
                     }
+
+                    //Конвертируем в байты
+                    byte[] data = packet.Serialize();
+                    //Отправляем данные в порт
+                    int n = base.Send(data, data.Length, RemotePoint);
+
+                    packet.Request = null;
                 }
-                catch (Exception ex)
-                {
-                    Logger.Error("Server.Client.Connect", ex);
+                catch
+                { 
                     continue;
                 }
                 finally
                 {
                     //Задержка отправки сообщения
-                    Thread.Sleep(Interval);
+                    Thread.Sleep(1000);
                 }
             }
         }
 
-        //Асинхрон
-        private async void ConnectAsync()
+        private void sendAsync()
         {
-            await Task.Run(() => Connect());
+            Task.Run(() => send());
         }
 
-        private Response WaitResponse(string id)
+        private void receive()
+        {
+            //Бесконечный цикл для приема данных
+            while (Started)
+            {
+                //Bind произойдет после отправки первого сообщения, 
+                //если запустим прием без Bind, то будет ошибка
+                if (!Client.IsBound)
+                {
+                    continue;
+                }
+
+                try
+                {
+                    var buffer = Receive(ref RemotePoint);
+                    Console.WriteLine(Encoding.Default.GetString(buffer));
+                    var resp = Response.Deserialize(buffer);
+                    if (resp == null)
+                    {
+                        continue;
+                    }
+
+                    switch (resp.Event)
+                    {
+                        case Events.Connected:
+                            Connected = true;
+                            OnConnected?.Invoke(this);
+                            break;
+                        case Events.Disconnected:
+                            Connected = false;
+                            break;
+                    }
+
+                    lock (locker)
+                    {
+                        if (packet.Header.Event != Events.None)
+                        {
+                            packet.Header.Event = Events.None;
+                        }
+                    }
+
+                    if (packet.Request != null)
+                    {
+                        Task.Run(() =>
+                        {
+                            QItem item;
+                            if (queue.TryGetValue(resp.Id, out item))
+                            {
+                                if (queue.TryUpdate(resp.Id, new QItem()
+                                {
+                                    Request = item.Request,
+                                    Sended = item.Sended,
+                                    Response = resp,
+                                    Received = true
+                                }, item))
+                                {
+
+                                }
+                            }
+                        });
+                    }
+                }
+                catch (SocketException ex)
+                {
+                    if (ex.NativeErrorCode == 10004)
+                    {
+                        return;
+                    }
+                }
+            }
+        }
+
+        private void receiveAsync()
+        {
+            Task.Run(() => receive());
+        }
+
+        private Response wait(string id)
         {
             int count = 0;
             Response response = null;
-            while (count < Timeout && IsConnected)
+
+            Task.Run(() =>
             {
-                if (Buffer.CheckResponse(id))
+                while (count < Timeout)
                 {
-                    Buffer.SetRequestIsReceived(id, true);
-                    response = Buffer.GetResponse(id);
-                    break;
+                    count++;
+                    Thread.Sleep(1000);
                 }
-                count++;
-                Thread.Sleep(1000);
+            });
+
+            var received = false;
+            QItem item;
+            while (count < Timeout && !received) {
+                foreach (var key in queue.Keys)
+                {                    
+                    if (queue.TryGetValue(key, out item))
+                    {
+                        if (item.Received)
+                        {
+                            response = item.Response;
+                            received = true;
+                            break;
+                        }
+                    }
+                }
             }
-            Buffer.Delete(id);
+            queue.TryRemove(id, out item);
             return response;
         }
 
@@ -180,136 +261,38 @@ namespace EgoUdpClient
         {
             try
             {
-                if (!IsConnected)
+                if (!Started || !Connected)
                 {
                     return null;
                 }
-                IsWrite = true;
-                var id = Buffer.SetRequest(request);
-                IsWrite = false;
-                return WaitResponse(id);
-                //return WaitResponseAsync(id).Result;
+
+                request.Id = Guid.NewGuid().ToString().Replace("-", "");
+
+                if (!queue.TryAdd(request.Id, new QItem() { Request = request }))
+                {
+                    return null;
+                }
+
+                return wait(request.Id);
             }
-            catch (Exception ex)
+            catch
             {
-                Logger.Error("Server.Client.Send", ex);
                 return null;
             }
         }
 
-        public Response Send(Commands command, Methods method, Data data)
+        public async Task<Response> SendAsync(Request request)
         {
-            return Send(new Request(command, method, data));
+            return await Task.Run(() => Send(request));
         }
 
-        private void ReceiveMessage()
+        public void Stop()
         {
-            try
-            {
-                IPEndPoint localAddress = new IPEndPoint(IPAddress.Any, LocalPort);
-                if (!Client.IsBound)
-                {
-                    //Connect(localAddress);
-                    Client.Bind(localAddress);
-                }
-                //Бесконечный цикл для приема данных
-                while (!cancellToken.Token.IsCancellationRequested)
-                {
-                    try
-                    {
-                        //Возвращаем набор байт
-                        byte[] data = this.Receive(ref localAddress);
-                        //Logger.Info("Server.Client.ReceiveMessage", Encoding.UTF8.GetString(data));
-                        //Создаём поток для преобразования байт
-                        using (MemoryStream stream = new MemoryStream(data))
-                        {
-                            try
-                            {
-                                //Пытаемся поток конвертиорвать в структуру
-                                //var message = (Message)ReceiveJson.ReadObject(stream);
-                                var response = (Response)ReceiveJson.ReadObject(stream);
-                                if (response == null)
-                                {
-                                    continue;
-                                }
-                                //Парсим полученные данные
-                                DoAsync(response);
-                            }
-                            catch (Exception ex)
-                            {
-                                Logger.Error("Server.Client.ReceiveMessage", ex);
-                                Thread.Sleep(1000);
-                            }
-                        }
-                    }
-                    catch (SocketException ex)
-                    {
-                        if (ex.NativeErrorCode == 10004)
-                        {
-                            return;
-                        }
-                        if (IsConnected)
-                        {
-                            //Buffer.SetRequestsIsSended(false);
-                            OnDisconnected?.Invoke();
-                            Logger.Error("Server.Client.ReceiveMessage", ex);
-                            IsConnected = false;
-                        }
-                        Thread.Sleep(1000);
-                    }
-                }
-            }
-            catch (Exception ex)
-            {
-                Logger.Error("Server.Client.ReceiveMessage", ex);
-                Thread.Sleep(3000);
-                ReceiveMessageAsync();
-            }
-        }
-
-        private async void ReceiveMessageAsync()
-        {
-            await Task.Run(() => ReceiveMessage());
-        }
-
-        public void Do(Response response)
-        {
-            try
-            {
-                Buffer.SetResponse(response);
-                if (response != null)
-                {
-                    Logger.Info("Server.Client.Do", response.ToString());
-                }
-
-                //Раскидываем по действиям
-                switch (response.Command)
-                {
-                    case Commands.Connected:
-                        IsConnected = true;
-                        OnConnected?.Invoke();
-                        break;
-                    case Commands.Disconnected:
-                        IsConnected = false;
-                        OnDisconnected?.Invoke();
-                        break;
-                }
-            }
-            catch (Exception ex)
-            {
-                Logger.Error("Server.Client.Do", ex);
-            }
-        }
-
-        public async void DoAsync(Response response)
-        {
-            await Task.Run(() => Do(response));
-        }
-
-        public void SetUsername(string Username, string DomainName)
-        {
-            sendMessage.Header.Login = Username;
-            sendMessage.Header.Domain = DomainName;
+            OnDisconnected?.Invoke(this);
+            Started = false;
+            packet.Header.Event = Events.Disconnected;
+            //Shutdown(SocketShutdown.Both);
+            Close();
         }
     }
 }

@@ -16,7 +16,8 @@ namespace EgoUdpClient.Protocol
     {
         None = 0,
         Connected = 1,
-        Disconnected = 2
+        Disconnected = 2,
+        CheckConnection = 3
     }
 
     public enum Methods

@@ -6,13 +6,15 @@ using System.Threading.Tasks;
 
 namespace EgoUdpClient.Protocol
 {
-    internal class Request
+    public class Request
     {
         public string Path { get; set; }
         public Methods Method { get; set; }
         public string Id { get; set; }
         public string ContentType { get; set; }
         public byte[] Data { get; set; }
+
+        public Request() { }
 
         public Request(string Path, Methods Method)
         {

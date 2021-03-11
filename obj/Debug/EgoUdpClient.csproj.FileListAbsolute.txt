@@ -1,0 +1,6 @@
+D:\YegorProjects\EgoUdpClient\EgoUdpClient\obj\Debug\EgoUdpClient.csprojAssemblyReference.cache
+D:\YegorProjects\EgoUdpClient\EgoUdpClient\obj\Debug\EgoUdpClient.csproj.CoreCompileInputs.cache
+D:\YegorProjects\EgoUdpClient\EgoUdpClient\bin\Debug\EgoUdpClient.dll
+D:\YegorProjects\EgoUdpClient\EgoUdpClient\bin\Debug\EgoUdpClient.pdb
+D:\YegorProjects\EgoUdpClient\EgoUdpClient\obj\Debug\EgoUdpClient.dll
+D:\YegorProjects\EgoUdpClient\EgoUdpClient\obj\Debug\EgoUdpClient.pdb

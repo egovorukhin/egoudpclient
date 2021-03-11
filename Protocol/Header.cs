@@ -6,7 +6,7 @@ using System.Threading.Tasks;
 
 namespace EgoUdpClient.Protocol
 {
-    internal class Header
+    public class Header
     {
         public string Hostname { get; set; }
         public string Login { get; set; }
